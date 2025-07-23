@@ -28,8 +28,6 @@ os.makedirs(PHOTOS_DIR, exist_ok=True)
 # FSM для выбора квартиры
 class UserStates(StatesGroup):
     waiting_for_apartment = State()
-    waiting_for_download_date = State()
-    waiting_for_download_apartment = State()
 
 # Клавиатура с квартирами
 def get_apartment_keyboard(apartments):
@@ -47,25 +45,67 @@ async def start(message: types.Message):
         return
     await message.answer("Добро пожаловать! Отправьте фото для сохранения.")
 
-# Обработка фото (одиночное)
+# Обработка фото
 @dp.message(F.photo)
-async def handle_single_photo(message: types.Message, state: FSMContext):
+async def handle_photo_album(message: types.Message, state: FSMContext):
     logger.info(f"Получено фото от {message.from_user.username}")
     if not message.from_user.username or message.from_user.username not in ALLOWED_USERS:
         return
 
+    # Сбрасываем состояние, если уже есть текущая квартира
     data = await state.get_data()
-    current_apartment = data.get("current_apartment")
+    if "current_apartment" in data:
+        await state.clear()
+        data = await state.get_data()
 
-    if current_apartment:
-        logger.info(f"Фото добавляется в квартиру {current_apartment}")
-        await save_photos_batch(message, state, current_apartment, [message.photo[-1].file_id])
+    media_group = message.media_group_id
+    file_id = message.photo[-1].file_id if message.photo else None
+
+    if not file_id:
+        logger.warning("Сообщение не содержит фото")
+        await message.answer("Ошибка: это не фото.")
         return
 
-    logger.info("Обнаружено одиночное фото")
-    await state.update_data(file_id=message.photo[-1].file_id)
+    if media_group:
+        logger.info(f"Обнаружен альбом. ID группы: {media_group}")
+        album_data = data.get("album", {})
+        current_album = album_data.get(media_group, [])
+        current_album.append(file_id)
+        album_data[media_group] = current_album
+        await state.update_data(album=album_data)
+
+        # Устанавливаем таймер на завершение альбома
+        if "album_timer" in data:
+            try:
+                data["album_timer"].cancel()
+            except:
+                pass
+
+        task = asyncio.create_task(wait_for_album_end(state, media_group, message.chat.id))
+        await state.update_data(album_timer=task)
+    else:
+        logger.info("Обнаружено одиночное фото")
+        await state.update_data(file_ids=[file_id])
+        keyboard = get_apartment_keyboard(APARTMENTS)
+        await message.answer("Выберите номер квартиры:", reply_markup=keyboard)
+        await state.set_state(UserStates.waiting_for_apartment)
+
+# Ждем завершения альбома
+async def wait_for_album_end(state: FSMContext, media_group_id: str, chat_id: int):
+    await asyncio.sleep(2)
+    data = await state.get_data()
+    album_data = data.get("album", {})
+    file_ids = album_data.get(media_group_id, [])
+
+    if not file_ids:
+        return
+
+    logger.info(f"Завершён альбом. {len(file_ids)} фото готовы к сохранению")
+    await state.update_data(file_ids=file_ids)
+    await state.update_data(album={})
+    await state.update_data(album_timer=None)
     keyboard = get_apartment_keyboard(APARTMENTS)
-    await message.answer("Выберите номер квартиры:", reply_markup=keyboard)
+    await bot.send_message(chat_id, "Выберите номер квартиры:", reply_markup=keyboard)
     await state.set_state(UserStates.waiting_for_apartment)
 
 # Обработчик выбора квартиры
@@ -79,21 +119,20 @@ async def process_apartment(message: types.Message, state: FSMContext):
         return
 
     data = await state.get_data()
-    file_id = data.get("file_id")
+    file_ids = data.get("file_ids", [])
 
-    if not file_id:
-        logger.warning("Нет file_id для сохранения")
+    if not file_ids:
+        logger.warning("Нет file_ids для сохранения")
         await message.answer("Ошибка: нет фото для сохранения.")
         await state.clear()
         return
 
-    await save_photos_batch(message, state, apartment, [file_id])
-    await message.answer(f"Фото сохранено в квартиру {apartment}.", reply_markup=types.ReplyKeyboardRemove())
-    await state.update_data(current_apartment=apartment)
+    await save_photos_batch(message, state, apartment, file_ids)
+    await message.answer(f"Фото сохранены в квартиру {apartment}.", reply_markup=types.ReplyKeyboardRemove())
     await state.clear()
 
 # Сохранение фото
-async def save_photos_batch(message, state, apartment, file_ids):
+async def save_photos_batch(message, state: FSMContext, apartment, file_ids):
     logger.info(f"Сохраняю {len(file_ids)} фото в квартиру {apartment}")
     current_date = datetime.now().strftime("%y-%m-%d")
     date_folder = os.path.join(PHOTOS_DIR, current_date)
@@ -111,87 +150,6 @@ async def save_photos_batch(message, state, apartment, file_ids):
         except Exception as e:
             logger.error(f"Ошибка при сохранении фото {file_id}: {e}", exc_info=True)
             await message.answer(f"Ошибка при сохранении фото: {e}")
-
-# Команда /list
-@dp.message(F.text == "/list")
-async def list_photos(message: types.Message):
-    if not message.from_user.username or message.from_user.username not in ALLOWED_USERS:
-        return
-
-    result = "📁 Структура сохраненных фото:\n"
-    for date_folder in sorted(os.listdir(PHOTOS_DIR)):
-        date_path = os.path.join(PHOTOS_DIR, date_folder)
-        if os.path.isdir(date_path):
-            result += f"\n📅 {date_folder}:\n"
-            for apt in sorted(os.listdir(date_path)):
-                apt_path = os.path.join(date_path, apt)
-                if os.path.isdir(apt_path):
-                    count = len(os.listdir(apt_path))
-                    result += f"  🏠 {apt} ({count} фото)\n"
-    await message.answer(result or "Нет данных.")
-
-# Команда /download
-@dp.message(F.text == "/download")
-async def download_photos(message: types.Message, state: FSMContext):
-    if not message.from_user.username or message.from_user.username not in ALLOWED_USERS:
-        return
-
-    if not os.path.exists(PHOTOS_DIR):
-        await message.answer("Нет сохраненных фото.")
-        return
-
-    dates = sorted(os.listdir(PHOTOS_DIR))
-    if not dates:
-        await message.answer("Нет доступных дат.")
-        return
-
-    keyboard = InlineKeyboardBuilder()
-    for date in dates:
-        keyboard.add(InlineKeyboardButton(text=date, callback_data=f"date_{date}"))
-    keyboard.adjust(2)
-    await message.answer("Выберите дату:", reply_markup=keyboard.as_markup())
-    await state.set_state(UserStates.waiting_for_download_date)
-
-# Callback выбора даты
-@dp.callback_query(UserStates.waiting_for_download_date)
-async def choose_apartment(callback: types.CallbackQuery, state: FSMContext):
-    date = callback.data.split("_")[1]
-    await state.update_data(selected_date=date)
-
-    date_path = os.path.join(PHOTOS_DIR, date)
-    apartments = sorted(os.listdir(date_path))
-    if not apartments:
-        await callback.message.edit_text("Нет квартир за эту дату.")
-        return
-
-    keyboard = InlineKeyboardBuilder()
-    for apt in apartments:
-        keyboard.add(InlineKeyboardButton(text=apt, callback_data=f"apt_{apt}"))
-    keyboard.adjust(2)
-    await callback.message.edit_text("Выберите квартиру:", reply_markup=keyboard.as_markup())
-    await state.set_state(UserStates.waiting_for_download_apartment)
-
-# Callback выбора квартиры
-@dp.callback_query(UserStates.waiting_for_download_apartment)
-async def send_photos(callback: types.CallbackQuery, state: FSMContext):
-    apartment = callback.data.split("_")[1]
-    data = await state.get_data()
-    date = data.get("selected_date")
-
-    if not date:
-        await callback.message.answer("Ошибка: дата не выбрана.")
-        return
-
-    apt_path = os.path.join(PHOTOS_DIR, date, apartment)
-    if not os.path.exists(apt_path):
-        await callback.message.answer("Квартира не найдена.")
-        return
-
-    archive_path = f"{apt_path}.zip"
-    shutil.make_archive(apt_path, 'zip', apt_path)
-    await callback.message.answer_document(types.FSInputFile(archive_path))
-    os.remove(archive_path)
-    await state.clear()
 
 # Запуск бота
 if __name__ == "__main__":
