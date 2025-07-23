@@ -1,6 +1,4 @@
-# config.py
-TELEGRAM_TOKEN = "8062969502:AAHw52lkhUfmtgos5Rb3U76XZVpGYJ5eaJs"  # Токен от BotFather
-GITHUB_TOKEN = "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"      # Персональный токен GitHub
-REPO_OWNER = "gleeebkaaa"        # Ваш GitHub-логин
-REPO_NAME = "photostk"             # Имя репозитория
-ALLOWED_USERS_FILE = "allowed_users.txt"  # Список разрешенных пользователей
+ALLOWED_USERS = ["razrabjs", "gleeebkaaaaa"]  # или любой другой ник
+APARTMENTS = ["743", "746", "748", "751", "753", "756", "757", "758", "760", "770", "774", "778", "783", "786", "790"]
+PHOTOS_DIR = "photos"
+BOT_TOKEN = "8062969502:AAHw52lkhUfmtgos5Rb3U76XZVpGYJ5eaJs"
