@@ -1,15 +1,17 @@
 import os
 import logging
 import asyncio
+import shutil  # ✅ Импортировано для архивации
 from datetime import datetime
 from aiogram import Bot, Dispatcher, F, types
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
-from aiogram.types import ReplyKeyboardMarkup, KeyboardButton
+from aiogram.types import ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.utils.keyboard import InlineKeyboardBuilder
 from config import BOT_TOKEN, ALLOWED_USERS, APARTMENTS, PHOTOS_DIR
 
-# Логирование
+# Настройка логирования
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
@@ -28,35 +30,138 @@ os.makedirs(PHOTOS_DIR, exist_ok=True)
 # FSM для выбора квартиры
 class UserStates(StatesGroup):
     waiting_for_apartment = State()
+    waiting_for_download_date = State()
+    waiting_for_download_apartment = State()
 
 # Клавиатура с квартирами
 def get_apartment_keyboard(apartments):
     rows = []
     for i in range(0, len(apartments), 5):
-        rows.append([KeyboardButton(text=apt) for apt in apartments[i:i+5]])
+        row = [KeyboardButton(text=apt) for apt in apartments[i:i+5]]
+        rows.append(row)
     return ReplyKeyboardMarkup(keyboard=rows, resize_keyboard=True, one_time_keyboard=True)
 
-# Команда /start
+# Обработчик команды /start
 @dp.message(F.text == "/start")
 async def start(message: types.Message):
     logger.info(f"Пользователь {message.from_user.username} отправил /start")
     if not message.from_user.username or message.from_user.username not in ALLOWED_USERS:
-        await message.answer("Вы не авторизованы.")
+        await message.answer("Вы не авторизованы для использования этого бота.")
         return
-    await message.answer("Добро пожаловать! Отправьте фото для сохранения.")
+    await message.answer("Добро пожаловать! Отправьте фото или альбом для сохранения.")
 
-# Обработка фото
+# Обработчик команды /list
+@dp.message(F.text == "/list")
+async def list_photos(message: types.Message):
+    logger.info(f"Пользователь {message.from_user.username} запросил /list")
+    if not message.from_user.username or message.from_user.username not in ALLOWED_USERS:
+        return
+
+    if not os.path.exists(PHOTOS_DIR):
+        await message.answer("Нет сохраненных фото.")
+        return
+
+    result = "📁 Структура сохраненных фото:\n"
+    for date_folder in sorted(os.listdir(PHOTOS_DIR)):
+        date_path = os.path.join(PHOTOS_DIR, date_folder)
+        if os.path.isdir(date_path):
+            result += f"\n📅 {date_folder}:\n"
+            for apt in sorted(os.listdir(date_path)):
+                apt_path = os.path.join(date_path, apt)
+                if os.path.isdir(apt_path):
+                    count = len(os.listdir(apt_path))
+                    result += f"  🏠 {apt} ({count} фото)\n"
+    await message.answer(result or "Нет данных.")
+
+# Обработчик команды /download
+@dp.message(F.text == "/download")
+async def download_photos(message: types.Message, state: FSMContext):
+    logger.info(f"Пользователь {message.from_user.username} запросил /download")
+    if not message.from_user.username or message.from_user.username not in ALLOWED_USERS:
+        return
+
+    if not os.path.exists(PHOTOS_DIR):
+        await message.answer("Нет сохраненных фото.")
+        return
+
+    # Список дат
+    dates = sorted(os.listdir(PHOTOS_DIR))
+    if not dates:
+        await message.answer("Нет доступных дат.")
+        return
+
+    # Inline-клавиатура с датами
+    keyboard = InlineKeyboardBuilder()
+    for date in dates:
+        keyboard.add(InlineKeyboardButton(text=date, callback_data=f"date_{date}"))
+    keyboard.adjust(2)
+    await message.answer("Выберите дату:", reply_markup=keyboard.as_markup())
+    await state.set_state(UserStates.waiting_for_download_date)
+
+# Callback-хендлер для выбора даты
+@dp.callback_query(UserStates.waiting_for_download_date)
+async def choose_apartment(callback: types.CallbackQuery, state: FSMContext):
+    date = callback.data.split("_")[1]
+    logger.info(f"Пользователь выбрал дату: {date}")
+    await state.update_data(selected_date=date)
+
+    # Список квартир за выбранную дату
+    date_path = os.path.join(PHOTOS_DIR, date)
+    apartments = sorted(os.listdir(date_path))
+    if not apartments:
+        await callback.message.edit_text("Нет доступных квартир за эту дату.")
+        return
+
+    # Inline-клавиатура с квартирами
+    keyboard = InlineKeyboardBuilder()
+    for apt in apartments:
+        keyboard.add(InlineKeyboardButton(text=apt, callback_data=f"apt_{apt}"))
+    keyboard.adjust(2)
+    await callback.message.edit_text("Выберите квартиру:", reply_markup=keyboard.as_markup())
+    await state.set_state(UserStates.waiting_for_download_apartment)
+
+# Callback-хендлер для выбора квартиры и отправки фото
+@dp.callback_query(UserStates.waiting_for_download_apartment)
+async def send_photos(callback: types.CallbackQuery, state: FSMContext):
+    apartment = callback.data.split("_")[1]
+    data = await state.get_data()
+    date = data.get("selected_date")
+
+    if not date:
+        await callback.message.answer("Ошибка: дата не выбрана.")
+        return
+
+    apt_path = os.path.join(PHOTOS_DIR, date, apartment)
+    if not os.path.exists(apt_path):
+        await callback.message.answer("Квартира не найдена.")
+        return
+
+    # Архивируем фото
+    archive_path = f"{apt_path}.zip"
+    shutil.make_archive(apt_path, 'zip', apt_path)
+    await callback.message.answer_document(types.FSInputFile(archive_path))
+    os.remove(archive_path)
+    await state.clear()
+
+# Обработчик фото (одиночное или альбом)
 @dp.message(F.photo)
 async def handle_photo_album(message: types.Message, state: FSMContext):
     logger.info(f"Получено фото от {message.from_user.username}")
     if not message.from_user.username or message.from_user.username not in ALLOWED_USERS:
         return
 
-    # Сбрасываем состояние, если уже есть текущая квартира
     data = await state.get_data()
-    if "current_apartment" in data:
+    current_apartment = data.get("current_apartment")
+
+    if current_apartment:
+        logger.info(f"Фото добавляется в квартиру {current_apartment}")
+        file_id = message.photo[-1].file_id if message.photo else None
+        if not file_id:
+            await message.answer("Ошибка: это не фото.")
+            return
+        await save_photos_batch(message, state, current_apartment, [file_id])
         await state.clear()
-        data = await state.get_data()
+        return
 
     media_group = message.media_group_id
     file_id = message.photo[-1].file_id if message.photo else None
@@ -92,7 +197,7 @@ async def handle_photo_album(message: types.Message, state: FSMContext):
 
 # Ждем завершения альбома
 async def wait_for_album_end(state: FSMContext, media_group_id: str, chat_id: int):
-    await asyncio.sleep(2)
+    await asyncio.sleep(2)  # Ждем 2 секунды после последнего фото
     data = await state.get_data()
     album_data = data.get("album", {})
     file_ids = album_data.get(media_group_id, [])
